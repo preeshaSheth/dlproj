@@ -1,0 +1,191 @@
+!pip install -q openai-whisper soundfile ffmpeg-python sentence-transformers scikit-learn python-Levenshtein
+
+import base64
+from google.colab import output
+import torch
+import whisper
+import numpy as np
+import soundfile as sf
+from IPython.display import Audio, display
+import ffmpeg
+from sentence_transformers import SentenceTransformer
+import torch.nn as nn
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print("Device:", DEVICE)
+
+
+# ==========================================================
+# 1) Record audio from browser → webm
+# ==========================================================
+def record_audio_colab(seconds=4):
+    print(f"🎙 Speak now... recording {seconds} sec")
+
+    js = f"""
+    async function record(sec) {{
+      const stream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+      const mediaRecorder = new MediaRecorder(stream);
+      let audioChunks = [];
+      mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+      mediaRecorder.start();
+      await new Promise(r => setTimeout(r, sec*1000));
+      mediaRecorder.stop();
+      await new Promise(r => mediaRecorder.onstop = r);
+      const blob = new Blob(audioChunks, {{ type: 'audio/webm' }});
+      const arrayBuffer = await blob.arrayBuffer();
+      const base64String = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+      return base64String;
+    }}
+    record({seconds});
+    """
+
+    b64 = output.eval_js(js)
+    data = base64.b64decode(b64)
+
+    with open("voice.webm", "wb") as f:
+        f.write(data)
+
+    print("Saved voice.webm")
+    return "voice.webm"
+
+
+# ==========================================================
+# 2) Convert webm → WAV (16 kHz)
+# ==========================================================
+def convert_webm_to_wav(in_path="voice.webm", out_path="voice.wav"):
+    try:
+        (
+            ffmpeg
+            .input(in_path)
+            .output(out_path, ac=1, ar=16000)
+            .overwrite_output()
+            .run(quiet=True)
+        )
+    except Exception as e:
+        print("Conversion error:", e)
+    return out_path
+
+
+# ==========================================================
+# 3) Load Whisper
+# ==========================================================
+print("Loading Whisper-medium (best for Hindi)...")
+model = whisper.load_model("medium")
+
+
+# ==========================================================
+# 4) Transcribe Hindi
+# ==========================================================
+def transcribe_hindi(audio_file):
+    result = model.transcribe(
+        audio_file,
+        language="hi",
+        task="transcribe",
+        fp16=False,
+        verbose=False,
+    )
+    return result["text"].strip()
+
+
+# ==========================================================
+# 5) DEEP LEARNING-BASED HINDI → ACTION CLASSIFIER
+# ==========================================================
+
+print("Loading Indic Sentence Transformer (Hindi embeddings)...")
+embed_model = SentenceTransformer("ai4bharat/indic-bert-v2")
+
+
+# Actions
+ACTIONS = ["wave", "bow", "dance", "idle", "pick object", "move forward"]
+ACTION2IDX = {a:i for i,a in enumerate(ACTIONS)}
+IDX2ACTION = {i:a for a,i in ACTION2IDX.items()}
+
+# Simple MLP classifier
+class ActionClassifier(nn.Module):
+    def _init_(self, input_dim=768, hidden_dim=256, num_classes=len(ACTIONS)):
+        super()._init_()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+    
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+classifier = ActionClassifier().to(DEVICE)
+
+
+# --- Synthetic Hindi dataset for training ---
+training_data = {
+    "wave": ["हाथ हिलाओ", "हाथ ऊपर नीचे करो", "हाथ लहराओ", "हिलाओ", "हाथ घुमाओ"],
+    "pick object": ["उठाओ", "पकड़ो", "चीज़ उठा लो", "ले आओ", "उठा लो"],
+    "dance": ["नाचो", "डांस करो", "थोड़ा नाच", "स्टेप करो", "डांस"],
+    "bow": ["झुको", "सिर झुकाओ", "नम्रता दिखाओ", "थोड़ा झुको"],
+    "move forward": ["आगे बढ़ो", "आगे जाओ", "चलो आगे", "आगे चलो"],
+    "idle": ["रुको", "कुछ मत करो", "खड़े रहो", "वेट करो"]
+}
+
+train_sentences = []
+train_labels = []
+
+for label, sentences in training_data.items():
+    for s in sentences:
+        train_sentences.append(s)
+        train_labels.append(ACTION2IDX[label])
+
+
+# --- Convert text → embeddings ---
+embeddings = embed_model.encode(train_sentences, convert_to_tensor=True).to(DEVICE)
+labels = torch.tensor(train_labels).to(DEVICE)
+
+
+# --- Train classifier ---
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(classifier.parameters(), lr=0.001)
+
+print("Training Deep Learning Action Classifier...")
+for epoch in range(25):
+    optimizer.zero_grad()
+    outputs = classifier(embeddings)
+    loss = criterion(outputs, labels)
+    loss.backward()
+    optimizer.step()
+    if epoch % 5 == 0:
+        print(f"Epoch {epoch}: Loss={loss.item():.4f}")
+
+
+# --- Prediction function ---
+def map_hindi_text_to_action_deep(txt):
+    if not txt:
+        return "idle"
+    
+    e = embed_model.encode([txt], convert_to_tensor=True).to(DEVICE)
+    
+    with torch.no_grad():
+        logits = classifier(e)
+        idx = torch.argmax(logits, dim=1).item()
+    
+    return IDX2ACTION[idx]
+
+
+# ==========================================================
+# 6) Full Pipeline
+# ==========================================================
+def run_demo(seconds=4):
+    webm = record_audio_colab(seconds)
+    wav = convert_webm_to_wav(webm)
+
+    print("\n🔊 Playing Recorded Audio:")
+    display(Audio(wav))
+
+    print("\nTranscribing...")
+    text = transcribe_hindi(wav)
+    print("Hindi Transcript:", text)
+
+    action = map_hindi_text_to_action_deep(text)
+    print("Predicted Action:", action)
+
+    return {"audio": wav, "text": text, "action": action}
+
+
+print("\nReady! Run:")
+print("run_demo(4)")
